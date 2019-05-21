@@ -22,7 +22,7 @@ th = packet + sizeof(struct ether_header) + sizeof(struct ip);
 /* Set TCP header things here */
 
 /* Calculate checksums */
-switch (packetchecksum_calculate(packet, sizeof(packet))) {
+switch (packetchecksum_calculate(packet, sizeof(packet))) { /* <-- This */
 case PACKETCHECKSUM_TOOSHORT:
         errx(1, "packet buffer too small");
 case PACKETCHECKSUM_INVALID:
