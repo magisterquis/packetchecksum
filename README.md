@@ -14,9 +14,11 @@ pcap_t              *p = magic_pcap_init();
 int ret;
 
 /* Roll a packet */
-ih = packet;
+eh = packet;
+/* set Ethernet header things here */
+ih = packet + sizeof(struct ether_header);
 /* Set IP header things here */
-th = packet + 20;
+th = packet + sizeof(struct ether_header) + sizeof(struct ip);
 /* Set TCP header things here */
 
 /* Calculate checksums */
