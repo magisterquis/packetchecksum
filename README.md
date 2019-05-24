@@ -24,7 +24,7 @@ total length of the packet.  Upon return the layer-3 and layer-4 checksum
 fields will be populated.
 
 Compiling into a project should be as simple as dropping the source and header
-files in.
+files in with the rest of the project's source.
 
 Example:
 ```c
