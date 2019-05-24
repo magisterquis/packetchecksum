@@ -1,10 +1,32 @@
 PacketChecksum
 ==============
-Will add checksums to a packet, for use with
-[`pcap_inject`](https://www.tcpdump.org/manpages/pcap_inject.3pcap.html).
+Simple library to add layer-3 and layer-4 checksums to an IP packet.
+Originally designed to make using
+[`pcap_inject`](https://www.tcpdump.org/manpages/pcap_inject.3pcap.html) a bit
+easier.
+
+Currently supports:
+- IPv4
+- IPv6
+- TCP
+- UDP
+- ICMP
+- ICMPv6
+
+Quite a bit of the source was taken from OpenBSD's
+[tcpdump](https://github.com/openbsd/src/tree/master/usr.sbin/tcpdump).
 
 Usage
 -----
+There is currently one function in this library, `packetchecksum_calculate()`.
+It expects two arguments: a pointer to the start of the Layer-3 header and the
+total length of the packet.  Upon return the layer-3 and layer-4 checksum
+fields will be populated.
+
+Compiling into a project should be as simple as dropping the source and header
+files in.
+
+Example:
 ```c
 uint8_t              packet[BUFLEN];
 struct ether_header *eh;
@@ -12,6 +34,8 @@ struct ip           *ih;
 struct tcphdr       *th;
 pcap_t              *p = magic_pcap_init();
 int ret;
+
+bzero(packet, sizeof(packet));
 
 /* Roll a packet */
 eh = packet;
@@ -37,3 +61,11 @@ if (sizeof(packet) != (ret = pcap_inject(p, packet, sizeof(packet)))) {
                 errx(4, "short write (%i < %i)", ret, sizeof(packet));
 }
 ```
+
+A more complete example can be found in [`example.c`](./example/example.c).
+
+IPv6
+----
+While the IPv6 header itself doesn't have a checksum field, skipping past the
+optional headers isn't quite as straightforward as one would like.  In general
+this should work pretty well except for the ESP optional header.

@@ -38,13 +38,13 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 /* The following can be returned by packetchecksum */
 #define PACKETCHECKSUM_TOOSHORT 1 /* Not enough packet data */
-#define PACKETCHECKSUM_INVALID  2 /* Packet had invalid data */
+#define PACKETCHECKSUM_INVALID  2 /* Packet had invalid or unsupported data */
 
 /* packetchecksum calculates the checksums for the IP packet packet, which may
  * be an IPv4 or IPv6 packet.  If the packet contains a TCP or UDP payload,
- * its checksum will be calculated as well.  The packet mus be no longer than
- * len.  It returns 0 on success, 1 if packet contains invalid data, or any
- * of the PACKETCHECKSUM_* constansts. */
+ * its checksum will be calculated as well.  The packet's length is given in
+ * len.  It returns 0 on success, 1 if packet contains invalid data, or any of
+ * the PACKETCHECKSUM_* constansts. */
 extern int packetchecksum_calculate(uint8_t *packet, size_t len);
 
 /* Sorry for the long name.  One day we may have a packetchecksum_validate. */
