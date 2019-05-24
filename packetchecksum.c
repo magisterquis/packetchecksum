@@ -35,8 +35,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+
+#include <netinet/icmp6.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
+#include <netinet/ip_icmp.h>
 #include <netinet/udp.h>
 #include <netinet/tcp.h>
 
@@ -49,15 +52,19 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define IPv4CSUMOFF    10
 
 static int ipv4_calculate_checksum(uint8_t *packet, size_t len, int *hlen);
+static int ipv6_determine_l4(uint8_t *p, size_t *len, uint8_t *l4p, uint8_t **l4);
 static int tcp_calculate_checksum(uint8_t ipv, const void *iph,
                 struct tcphdr *tp, int length);
 static int udp_calculate_checksum(uint8_t ipv, const void *iph,
                 struct udphdr *uh, int length);
+static int icmp_calculate_checksum(uint8_t *p, const int len);
+static int icmp6_calculate_checksum(const struct ip6_hdr *ip6, struct icmp6_hdr *icmp6, const int len);
 static uint16_t in_cksum(const void *addr, size_t len, uint32_t sum);
 static uint16_t tcp_cksum(const struct ip *ip, const struct tcphdr *tp,
                 int len);
 static uint16_t tcp6_cksum(const struct ip6_hdr *ip6, const struct tcphdr *tp,
                 u_int len);
+static uint16_t icmp6_cksum(const struct ip6_hdr *ip6, const struct icmp6_hdr *icmp6, uint32_t len);
 static uint32_t in_cksum_add(const void *buf, size_t len, uint32_t sum);
 
 int
@@ -81,12 +88,13 @@ packetchecksum_calculate(uint8_t *packet, size_t len)
                         len -= hlen;
                         break;
                 case 6:
-                        /* No checksum here */
-                        if (sizeof(struct ip6_hdr) >= len)
+                        /* No checksum here, but have to work out where the
+                         * L4 payload actually starts. */
+                        if (sizeof(struct ip6_hdr) > len)
                                 return PACKETCHECKSUM_TOOSHORT;
-                        l4p = ((struct ip6_hdr *)packet)->ip6_nxt;
-                        l4 = packet + sizeof(struct ip6_hdr);
-                        len -= sizeof(struct ip6_hdr);
+                        if (0 != (ret = ipv6_determine_l4(packet, &len, &l4p,
+                                                        (uint8_t **)&l4)))
+                                return ret;
                         break;
                 default:
                         /* We don't support this IP version */
@@ -105,6 +113,14 @@ packetchecksum_calculate(uint8_t *packet, size_t len)
                 case IPPROTO_UDP:
                         return udp_calculate_checksum(ipv, packet,
                                         (struct udphdr *)l4, len);
+                case IPPROTO_ICMP:
+                        return icmp_calculate_checksum(l4, len);
+                case IPPROTO_ICMPV6:
+                        if (6 != ipv)
+                                return PACKETCHECKSUM_INVALID;
+                        return icmp6_calculate_checksum(
+                                        (struct ip6_hdr *)packet,
+                                        (struct icmp6_hdr *)l4, len);
                 default:
                         /* Not having a supported type isn't an error.  We
                          * simply don't calculate the checksum. */
@@ -124,7 +140,7 @@ ipv4_calculate_checksum(uint8_t *packet, size_t len, int *hlen)
                 return PACKETCHECKSUM_TOOSHORT;
 
         /* Only use as much packet as we've IPv4 header */
-        if (len <= (*hlen = (4 * (*packet & 0x0F))))
+        if (len < (*hlen = (4 * (*packet & 0x0F))))
                 return PACKETCHECKSUM_TOOSHORT;
 
         /* Zero out the checksum field, for calculating */
@@ -137,6 +153,73 @@ ipv4_calculate_checksum(uint8_t *packet, size_t len, int *hlen)
         return 0;
 }
 
+/* ipv6_determine_l4 works out the L4 protocol and the start of the L4 header
+ * in the IPv6 packet starting at p.  Len will be updated to the size of the
+ * non-L3 parts of the packet. */
+int
+ipv6_determine_l4(uint8_t *p, size_t *len, uint8_t *l4p, uint8_t **l4)
+{
+        uint8_t hlen;
+
+        /* Start at the IPv6 header */
+        *l4 = p;
+
+        for (;;) {
+                /* By here we should have *l4p containing a protocol number,
+                 * *l4 pointing at the start of the next header, and *len with
+                 * the amount of packet left. */
+
+                /* Only the first time, when we're processing the IPv6
+                 * header */
+                if (*l4 == p) {
+                        if (sizeof(struct ip6_hdr) > *len)
+                                return PACKETCHECKSUM_TOOSHORT;
+                        *l4p = ((struct ip6_hdr *)p)->ip6_nxt;
+                        *l4 += sizeof(struct ip6_hdr);
+                        *len -= sizeof(struct ip6_hdr);
+                        continue;
+                }
+                switch (*l4p) {
+                        /* Extension Headers with supplied lengths */
+                        case IPPROTO_IP: 
+                        case IPPROTO_ROUTING:
+                        case IPPROTO_AH:
+                        case IPPROTO_DSTOPTS:
+                        case 139: /* Host Identity Protocol */
+                        case 140: /* Shim 6 */
+                                if (2 > *len)
+                                        return PACKETCHECKSUM_TOOSHORT;
+                                /* For all of these, the next header is the
+                                 * first octet and the header length is the
+                                 * next octet. */
+                                hlen = *(*l4+1) + 1;
+                                if (hlen > *len)
+                                        return PACKETCHECKSUM_TOOSHORT;
+                                *l4p = **l4;
+                                *l4 += hlen;
+                                len -= hlen;
+                                continue;
+                                
+
+                        /* Extension headers with set lengths */
+                        case IPPROTO_FRAGMENT:
+                                hlen = 8;
+                                if (hlen > *len)
+                                        return PACKETCHECKSUM_TOOSHORT;
+                                *l4p = **l4;
+                                *l4 += hlen;
+                                len -= hlen;
+                                continue;
+
+                        /* Everything else is either a L4 header we process
+                         * or an extension we don't handle.  Either way, the
+                         * next step will take care of it. */
+                        default:
+                                return 0;
+                }
+        }
+}
+
 /* tcp_calculate_checksum calculates the checksum for the len bytes at tp and
  * updates the checksum in tp. iph will be interpreted as either an IPv6 or
  * IPv6 header based on ipv. */
@@ -145,7 +228,7 @@ tcp_calculate_checksum(uint8_t ipv, const void *iph, struct tcphdr *tp,
                 int length)
 {
         /* Validate length */
-        if (4 * tp->th_off >= length)
+        if (4 * tp->th_off > length)
                 return PACKETCHECKSUM_TOOSHORT;
 
         /* Zero checksum field */
@@ -173,11 +256,11 @@ udp_calculate_checksum(uint8_t ipv, const void *iph, struct udphdr *up,
 /* Nearly all of the code in this function was copy/pasted from OpenBSD's
  * tcpdump which is released under the following license: */
 
-/*	$OpenBSD: print-udp.c,v 1.51 2018/10/22 16:12:45 kn Exp $	*/
+/*        $OpenBSD: print-udp.c,v 1.51 2018/10/22 16:12:45 kn Exp $        */
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996
- *	The Regents of the University of California.  All rights reserved.
+ *        The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that: (1) source code distributions
@@ -202,28 +285,28 @@ udp_calculate_checksum(uint8_t ipv, const void *iph, struct udphdr *up,
         uint32_t cksum = 0;
 
         /* Validate length */
-        if (sizeof(*up) >= length)
+        if (sizeof(*up) > length)
                 return PACKETCHECKSUM_TOOSHORT;
 
         /* Add IP pseudoheader to checksum */
         switch (ipv) {
                 case 6:
                         ip6 = iph;
-			cksum = in_cksum_add(&ip6->ip6_src,
+                        cksum = in_cksum_add(&ip6->ip6_src,
                                         sizeof(ip6->ip6_src), cksum);
-			cksum = in_cksum_add(&ip6->ip6_dst,
+                        cksum = in_cksum_add(&ip6->ip6_dst,
                                         sizeof(ip6->ip6_dst), cksum);
-			break;
-		case 4:
+                        break;
+                case 4:
                         ip4 = iph;
-			cksum = in_cksum_add(&ip4->ip_src,
+                        cksum = in_cksum_add(&ip4->ip_src,
                                         sizeof(ip4->ip_src), cksum);
-			cksum = in_cksum_add(&ip4->ip_dst,
+                        cksum = in_cksum_add(&ip4->ip_dst,
                                         sizeof(ip4->ip_dst), cksum);
-			break;
+                        break;
         }
         cksum += htons(length);
-	cksum += htons(IPPROTO_UDP);
+        cksum += htons(IPPROTO_UDP);
 
         /* Add UDP header to checksum */
         cksum += up->uh_sport;
@@ -238,13 +321,47 @@ udp_calculate_checksum(uint8_t ipv, const void *iph, struct udphdr *up,
         return 0;
 }
 
+/* icmp_calculate_checksum calculates and adds the icmp checksum to the ICMP
+ * message starting at p. */
+static int
+icmp_calculate_checksum(uint8_t *p, const int len)
+{
+        struct icmp *icmph;
+        
+        /* Zero out the current checksum */
+        if (sizeof(struct icmp) > len)
+                return PACKETCHECKSUM_TOOSHORT;
+        icmph = (struct icmp *)p;
+        icmph->icmp_cksum = 0;
+
+        /* Sum the message and add it to the header */
+	icmph->icmp_cksum = in_cksum((const u_short *)p, len, 0);
+
+        return 0;
+}
+
+/* icmp6_calculate_checksum calculates and adds the checksum to the ICMPv6
+ * message starting at p. */
+static int
+icmp6_calculate_checksum(const struct ip6_hdr *ip6, struct icmp6_hdr *icmp6,
+                const int len)
+{
+        if (sizeof(struct icmp6_hdr) > len)
+                return PACKETCHECKSUM_TOOSHORT;
+
+        icmp6->icmp6_cksum = 0;
+        icmp6->icmp6_cksum = icmp6_cksum(ip6, icmp6, len);
+
+        return 0;
+}
+
 /* The below from OpenBSD */
 
-/*	$OpenBSD: in_cksum.c,v 1.2 2018/07/06 04:49:21 dlg Exp $	*/
+/*        $OpenBSD: in_cksum.c,v 1.2 2018/07/06 04:49:21 dlg Exp $        */
 
 /*
  * Copyright (c) 1988, 1992, 1993
- *	The Regents of the University of California.  All rights reserved.
+ *        The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -270,38 +387,34 @@ udp_calculate_checksum(uint8_t ipv, const void *iph, struct udphdr *up,
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- *	@(#)in_cksum.c	8.1 (Berkeley) 6/10/93
+ *        @(#)in_cksum.c        8.1 (Berkeley) 6/10/93
  */
-
-/* #include <sys/types.h> */ /* DEBUG */
-
-/* #include "interface.h" */ /* DEBUG */
 
 static uint32_t
 in_cksum_add(const void *buf, size_t len, uint32_t sum)
 {
-	const uint16_t *words = buf;
+        const uint16_t *words = buf;
 
-	while (len > 1) {
-		sum += *words++;
-		len -= sizeof(*words);
-	}
+        while (len > 1) {
+                sum += *words++;
+                len -= sizeof(*words);
+        }
 
-	if (len == 1) {
-		uint8_t byte = *(const uint8_t *)words;
-		sum += htons(byte << 8);
-	}
+        if (len == 1) {
+                uint8_t byte = *(const uint8_t *)words;
+                sum += htons(byte << 8);
+        }
 
-	return (sum);
+        return (sum);
 }
 
 static uint16_t
 in_cksum_fini(uint32_t sum)
 {
-	sum = (sum >> 16) + (sum & 0xffff);	/* add hi 16 to low 16 */
-	sum += (sum >> 16);			/* add carry */
+        sum = (sum >> 16) + (sum & 0xffff);        /* add hi 16 to low 16 */
+        sum += (sum >> 16);                        /* add carry */
 
-	return (~sum);
+        return (~sum);
 }
 
 /*
@@ -311,14 +424,14 @@ in_cksum_fini(uint32_t sum)
 static uint16_t
 in_cksum(const void *addr, size_t len, uint32_t sum)
 {
-	return (in_cksum_fini(in_cksum_add(addr, len, sum)));
+        return (in_cksum_fini(in_cksum_add(addr, len, sum)));
 }
 
-/*	$OpenBSD: print-tcp.c,v 1.38 2018/10/22 16:12:45 kn Exp $	*/
+/*        $OpenBSD: print-tcp.c,v 1.38 2018/10/22 16:12:45 kn Exp $        */
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997
- *	The Regents of the University of California.  All rights reserved.
+ *        The Regents of the University of California.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that: (1) source code distributions
@@ -340,59 +453,110 @@ in_cksum(const void *addr, size_t len, uint32_t sum)
 static uint16_t
 tcp_cksum(const struct ip *ip, const struct tcphdr *tp, int len)
 {
-	union phu {
-		struct phdr {
-			u_int32_t src;
-			u_int32_t dst;
-			u_char mbz;
-			u_char proto;
-			u_int16_t len;
-		} ph;
-		u_int16_t pa[6];
-	} phu;
-	const u_int16_t *sp;
-	u_int32_t sum;
+        union phu {
+                struct phdr {
+                        u_int32_t src;
+                        u_int32_t dst;
+                        u_char mbz;
+                        u_char proto;
+                        u_int16_t len;
+                } ph;
+                u_int16_t pa[6];
+        } phu;
+        const u_int16_t *sp;
+        u_int32_t sum;
 
-	/* pseudo-header.. */
-	phu.ph.len = htons((u_int16_t)len);
-	phu.ph.mbz = 0;
-	phu.ph.proto = IPPROTO_TCP;
-	memcpy(&phu.ph.src, &ip->ip_src.s_addr, sizeof(u_int32_t));
-	memcpy(&phu.ph.dst, &ip->ip_dst.s_addr, sizeof(u_int32_t));
+        /* pseudo-header.. */
+        phu.ph.len = htons((u_int16_t)len);
+        phu.ph.mbz = 0;
+        phu.ph.proto = IPPROTO_TCP;
+        memcpy(&phu.ph.src, &ip->ip_src.s_addr, sizeof(u_int32_t));
+        memcpy(&phu.ph.dst, &ip->ip_dst.s_addr, sizeof(u_int32_t));
 
-	sp = &phu.pa[0];
-	sum = sp[0]+sp[1]+sp[2]+sp[3]+sp[4]+sp[5];
+        sp = &phu.pa[0];
+        sum = sp[0]+sp[1]+sp[2]+sp[3]+sp[4]+sp[5];
 
-	return in_cksum((u_short *)tp, len, sum);
+        return in_cksum((u_short *)tp, len, sum);
 }
 
 static uint16_t
 tcp6_cksum(const struct ip6_hdr *ip6, const struct tcphdr *tp, u_int len)
 {
-	union {
-		struct {
-			struct in6_addr ph_src;
-			struct in6_addr ph_dst;
-			u_int32_t       ph_len;
-			u_int8_t        ph_zero[3];
-			u_int8_t        ph_nxt;
-		} ph;
-		u_int16_t pa[20];
-	} phu;
-	size_t i;
-	u_int32_t sum = 0;
+        union {
+                struct {
+                        struct in6_addr ph_src;
+                        struct in6_addr ph_dst;
+                        u_int32_t       ph_len;
+                        u_int8_t        ph_zero[3];
+                        u_int8_t        ph_nxt;
+                } ph;
+                u_int16_t pa[20];
+        } phu;
+        size_t i;
+        u_int32_t sum = 0;
 
-	/* pseudo-header */
-	memset(&phu, 0, sizeof(phu));
-	phu.ph.ph_src = ip6->ip6_src;
-	phu.ph.ph_dst = ip6->ip6_dst;
-	phu.ph.ph_len = htonl(len);
-	phu.ph.ph_nxt = IPPROTO_TCP;
+        /* pseudo-header */
+        memset(&phu, 0, sizeof(phu));
+        phu.ph.ph_src = ip6->ip6_src;
+        phu.ph.ph_dst = ip6->ip6_dst;
+        phu.ph.ph_len = htonl(len);
+        phu.ph.ph_nxt = IPPROTO_TCP;
 
-	for (i = 0; i < sizeof(phu.pa) / sizeof(phu.pa[0]); i++)
-		sum += phu.pa[i];
+        for (i = 0; i < sizeof(phu.pa) / sizeof(phu.pa[0]); i++)
+                sum += phu.pa[i];
 
-	return in_cksum((u_short *)tp, len, sum);
+        return in_cksum((u_short *)tp, len, sum);
 }
 
-/* TODO: Note we don't support IPv6 extension headers */
+/*	$OpenBSD: print-icmp6.c,v 1.22 2018/10/22 16:12:45 kn Exp $	*/
+
+/*
+ * Copyright (c) 1988, 1989, 1990, 1991, 1993, 1994
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that: (1) source code distributions
+ * retain the above copyright notice and this paragraph in its entirety, (2)
+ * distributions including binary code include the above copyright notice and
+ * this paragraph in its entirety in the documentation or other materials
+ * provided with the distribution, and (3) all advertising materials mentioning
+ * features or use of this software display the following acknowledgement:
+ * ``This product includes software developed by the University of California,
+ * Lawrence Berkeley Laboratory and its contributors.'' Neither the name of
+ * the University nor the names of its contributors may be used to endorse
+ * or promote products derived from this software without specific prior
+ * written permission.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
+static uint16_t
+icmp6_cksum(const struct ip6_hdr *ip6, const struct icmp6_hdr *icmp6,
+    uint32_t len)
+{
+        union {
+                struct {
+                        struct in6_addr ph_src;
+                        struct in6_addr ph_dst;
+                        u_int32_t       ph_len;
+                        u_int8_t        ph_zero[3];
+                        u_int8_t        ph_nxt;
+                } ph;
+                u_int16_t pa[20];
+        } phu;
+        size_t i;
+        u_int32_t sum = 0;
+
+        /* pseudo-header */
+        memset(&phu, 0, sizeof(phu));
+        phu.ph.ph_src = ip6->ip6_src;
+        phu.ph.ph_dst = ip6->ip6_dst;
+        phu.ph.ph_len = htonl(len);
+        phu.ph.ph_nxt = IPPROTO_ICMPV6;
+
+        for (i = 0; i < sizeof(phu.pa) / sizeof(phu.pa[0]); i++)
+                sum += phu.pa[i];
+
+        return in_cksum((u_short *)icmp6, len, sum);
+}
